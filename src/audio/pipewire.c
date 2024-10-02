@@ -153,7 +153,7 @@ static AudioID *pipewire_open(void **pars)
     // initialise the event file descripter and the stream
     pw_thread_loop_lock(state->loop);
     state->stream = pw_stream_new_simple(pw_thread_loop_get_loop(state->loop), pars[1], pw_properties_new(PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Playback", PW_KEY_MEDIA_ROLE, "Accessibility", NULL), &stream_events, state);
-    if ((state->eventfd_number = spa_system_eventfd_create(pw_thread_loop_get_loop(state->loop)->system, SPA_FD_CLOEXEC)) < 0)
+    if ((state->eventfd_number = spa_system_eventfd_create(state->program_loop->system, SPA_FD_CLOEXEC)) < 0)
         return NULL;
     pw_thread_loop_unlock(state->loop);
     // start the threaded loop
@@ -283,14 +283,16 @@ static int pipewire_set_volume(AudioID *id, int volume)
 static int pipewire_close(AudioID *id)
 {
     module_state *state = (module_state *)id;
-    // unlink and disconnect the stream
-    pw_stream_disconnect(state->stream);
-    pw_stream_destroy(state->stream);
 
-    // stop the thread loop
-    pw_thread_loop_stop(state->loop);
+    pw_thread_loop_lock(state->loop);
+    // unlink and disconnect the stream
+    pw_stream_destroy(state->stream);
+    pw_thread_loop_unlock(state->loop);
+
+    // stop and destroy the thread loop
     pw_thread_loop_destroy(state->loop);
 
+    spa_system_close(state->program_loop->system, state->eventfd_number);
     // free the memory allocated by  the sample buffer used to hold samples between pipewire and speech dispatcher
     free(state->sample_buffer);
     // uninitialize pipewire
