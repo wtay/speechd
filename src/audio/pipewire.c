@@ -54,6 +54,8 @@ typedef struct
 {
     AudioID id;                  // to comply with the speech dispatcher contract, make the first field of the struct the type expected by the spd callbacks, so that casting from it isn't entirely undefined behaviour
     struct pw_thread_loop *loop; // a pipewire loop object which can be used without blocking the main thread, in this case the thread of speech dispatcher
+    struct pw_loop *program_loop;
+    bool stopping;
     struct pw_stream *stream;    // this represents an instance of this module, a node of the media graph along with other metadata, which will be linked to the default output device
     struct spa_ringbuffer rb;    // a thread-safe ring buffer implementation which uses atomic operations  to guarantee some semblance of thread safety, therefore it doesn't require a mutex
     char *sample_buffer;         // the heap storage memory which will be backing the atomic ring buffer implementation, it's on the heap because this struct would be transfered across callback functions a lot, and such a large buffer could cause a stack overflow on some hardware architectures
@@ -129,7 +131,7 @@ static void on_process(void *userdata)
     buf->datas[0].chunk->stride = state->stride;
     pw_stream_queue_buffer(state->stream, b);
     // signal to the main thread that data can be written again
-    spa_system_eventfd_write(pw_thread_loop_get_loop(state->loop)->system, state->eventfd_number, 42);
+    spa_system_eventfd_write(state->program_loop->system, state->eventfd_number, 42);
 }
 // pipewire internal: structure describing what kind of events we subscribe to
 // For now, this is only on_process
@@ -145,6 +147,7 @@ static AudioID *pipewire_open(void **pars)
     module_state *state = (module_state *)malloc(sizeof(module_state));
     pw_init(0, NULL);
     state->loop = pw_thread_loop_new("pipewire audio thread", NULL);
+    state->program_loop = pw_thread_loop_get_loop(state->loop);
     state->rb = SPA_RINGBUFFER_INIT();
     state->sample_buffer = malloc(SAMPLE_BUFFER_SIZE);
     // initialise the event file descripter and the stream
@@ -206,8 +209,9 @@ static int pipewire_feed_sink_overlap(AudioID *id, AudioTrack track)
     uint8_t *s = (uint8_t*)track.samples;
     // if the stream has been deactivated because of a pipewire_stop call, we activate it
     pw_thread_loop_lock(state->loop);
-    if (pw_stream_get_state(state->stream, NULL) == PW_STREAM_STATE_PAUSED)
+    if (state->stopping)
     {
+        state->stopping = false;
         pw_stream_set_active(state->stream, true);
     }
     pw_thread_loop_unlock(state->loop);
@@ -219,6 +223,9 @@ static int pipewire_feed_sink_overlap(AudioID *id, AudioTrack track)
         // we wait till fill_quantity is not empty after this thread can continue, aka after on_process updated that ringbuffer index with what it managed to play, so that we have some room in the buffer to fill from what's remaining of what was given to us by speech dispatcher
         while (true)
         {
+            if (state->stopping)
+                return 0;
+
             fill_quantity = spa_ringbuffer_get_write_index(&state->rb, &write_index);
             // see if there's some room in the buffer, if so, stop locking
             room_left_in_buffer = SAMPLE_BUFFER_SIZE - fill_quantity;
@@ -226,10 +233,7 @@ static int pipewire_feed_sink_overlap(AudioID *id, AudioTrack track)
                 // then we have room in the buffer, so stop locking our thread
                 break;
             // otherwise, to not starve a cpu core of resources, we suspend our spinning until something, in this case on_process, wakes us up. In an embedded system without these primitives, spinning endlessly like that would be the only option. We could do the same here, but for efficiency reasons alone, we don't
-            pw_thread_loop_lock(state->loop);
-            struct pw_loop *program_loop = pw_thread_loop_get_loop(state->loop);
-            pw_thread_loop_unlock(state->loop);
-            spa_system_eventfd_read(program_loop->system, state->eventfd_number, &dummy);
+            spa_system_eventfd_read(state->program_loop->system, state->eventfd_number, &dummy);
         }
         // we write the amount of samples we can at this time without overflowing the buffer, to the memory area represented by the amount of room that's free after the last on_process call, to then be enqueued by pipewire
         //  we assume speech dispatcher gives us the correct number of bytes for the format it chose, enough for this chunk. If that's not the case, there's not much we could do besides reading uninitialized memory or an incomplete chunk, unfortunately
@@ -249,10 +253,16 @@ static int pipewire_stop(AudioID *id)
 {
     module_state *state = (module_state *)id;
     // I don't know how to pause or stop a stream without setting properties on it, so that won't be used in the first version of this. So, for now, setting a stream as inactive will suspend it from being called at all, similar to pausing it
+    state->stopping = true;
+    spa_system_eventfd_write(state->program_loop->system, state->eventfd_number, 42);
+
     //  this function returns error codes directly, so I use this as the return value
     pw_thread_loop_lock(state->loop);
     pw_stream_set_active(state->stream, false);
     pw_thread_loop_unlock(state->loop);
+
+    state->rb = SPA_RINGBUFFER_INIT();
+
     return 0;
 }
 static int pipewire_set_volume(AudioID *id, int volume)
@@ -273,12 +283,14 @@ static int pipewire_set_volume(AudioID *id, int volume)
 static int pipewire_close(AudioID *id)
 {
     module_state *state = (module_state *)id;
-    // stop the thread loop first
-    pw_thread_loop_stop(state->loop);
-    pw_thread_loop_destroy(state->loop);
     // unlink and disconnect the stream
     pw_stream_disconnect(state->stream);
     pw_stream_destroy(state->stream);
+
+    // stop the thread loop
+    pw_thread_loop_stop(state->loop);
+    pw_thread_loop_destroy(state->loop);
+
     // free the memory allocated by  the sample buffer used to hold samples between pipewire and speech dispatcher
     free(state->sample_buffer);
     // uninitialize pipewire
